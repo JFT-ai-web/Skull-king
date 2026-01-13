@@ -1,0 +1,680 @@
+import React, { useState, useEffect } from 'react';
+import { Skull, Users, Trophy, Crown, Anchor, Heart, Spade, Circle, Flag } from 'lucide-react';
+
+// ============================================================================
+// TYPES
+// ============================================================================
+
+type Suit = 'yellow' | 'purple' | 'green' | 'black';
+type SpecialType = 'escape' | 'pirate' | 'mermaid' | 'skullking';
+
+interface Card {
+  id: string;
+  type: 'suited' | 'special';
+  suit?: Suit;
+  number?: number;
+  special?: SpecialType;
+}
+
+interface Player {
+  id: string;
+  name: string;
+  hand: Card[];
+  bid: number | null;
+  tricksWon: number;
+  score: number;
+  roundScores: number[];
+}
+
+interface TrickCard {
+  card: Card;
+  playerId: string;
+}
+
+interface GameConfig {
+  numPlayers: number;
+  playerNames: string[];
+  maxRounds: number;
+}
+
+type GamePhase = 'setup' | 'bidding' | 'playing' | 'roundEnd' | 'gameEnd';
+
+// ============================================================================
+// GAME ENGINE
+// ============================================================================
+
+const SUITS: Suit[] = ['yellow', 'purple', 'green', 'black'];
+
+function createDeck(): Card[] {
+  const deck: Card[] = [];
+  let id = 0;
+
+  // Suited cards (1-14 for each suit)
+  SUITS.forEach(suit => {
+    for (let num = 1; num <= 14; num++) {
+      deck.push({ id: `${id++}`, type: 'suited', suit, number: num });
+    }
+  });
+
+  // Special cards
+  for (let i = 0; i < 5; i++) {
+    deck.push({ id: `${id++}`, type: 'special', special: 'escape' });
+  }
+  for (let i = 0; i < 5; i++) {
+    deck.push({ id: `${id++}`, type: 'special', special: 'pirate' });
+  }
+  for (let i = 0; i < 2; i++) {
+    deck.push({ id: `${id++}`, type: 'special', special: 'mermaid' });
+  }
+  deck.push({ id: `${id++}`, type: 'special', special: 'skullking' });
+
+  return deck;
+}
+
+function shuffleDeck(deck: Card[], seed: number = Date.now()): Card[] {
+  const shuffled = [...deck];
+  let random = seed;
+  
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    random = (random * 9301 + 49297) % 233280;
+    const j = Math.floor((random / 233280) * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  
+  return shuffled;
+}
+
+function dealHands(players: Player[], roundNumber: number): Player[] {
+  const deck = shuffleDeck(createDeck());
+  const cardsPerPlayer = roundNumber;
+  
+  return players.map((player, idx) => ({
+    ...player,
+    hand: deck.slice(idx * cardsPerPlayer, (idx + 1) * cardsPerPlayer),
+    tricksWon: 0,
+    bid: null
+  }));
+}
+
+function getLegalMoves(hand: Card[], trick: TrickCard[], leadSuit: Suit | null): Card[] {
+  if (trick.length === 0 || !leadSuit) return hand;
+  
+  const suitedCards = hand.filter(c => c.type === 'suited' && c.suit === leadSuit);
+  
+  if (suitedCards.length > 0) return suitedCards;
+  return hand;
+}
+
+function getLeadSuit(trick: TrickCard[]): Suit | null {
+  for (const tc of trick) {
+    if (tc.card.type === 'suited' && tc.card.suit) {
+      return tc.card.suit;
+    }
+  }
+  return null;
+}
+
+function resolveTrick(trick: TrickCard[]): { winnerId: string; bonuses: { skullKingPirates: number; skullKingMermaid: number } } {
+  const bonuses = { skullKingPirates: 0, skullKingMermaid: 0 };
+  
+  // Check for special cards
+  const mermaidCards = trick.filter(tc => tc.card.special === 'mermaid');
+  const skullKingCards = trick.filter(tc => tc.card.special === 'skullking');
+  const pirateCards = trick.filter(tc => tc.card.special === 'pirate');
+  
+  // Mermaid beats Skull King
+  if (mermaidCards.length > 0 && skullKingCards.length > 0) {
+    return { winnerId: mermaidCards[0].playerId, bonuses };
+  }
+  
+  // Skull King beats Pirates (and earns bonuses)
+  if (skullKingCards.length > 0) {
+    if (pirateCards.length > 0) {
+      bonuses.skullKingPirates = pirateCards.length * 30;
+    }
+    if (mermaidCards.length > 0) {
+      bonuses.skullKingMermaid = 50;
+    }
+    return { winnerId: skullKingCards[0].playerId, bonuses };
+  }
+  
+  // Pirates beat suited cards
+  if (pirateCards.length > 0) {
+    return { winnerId: pirateCards[0].playerId, bonuses };
+  }
+  
+  // All escapes? First escape wins
+  const nonEscapeCards = trick.filter(tc => tc.card.special !== 'escape');
+  if (nonEscapeCards.length === 0) {
+    return { winnerId: trick[0].playerId, bonuses };
+  }
+  
+  // Normal suited card logic
+  const leadSuit = getLeadSuit(trick);
+  if (!leadSuit) return { winnerId: trick[0].playerId, bonuses };
+  
+  let winner = trick[0];
+  let highestValue = -1;
+  
+  for (const tc of trick) {
+    if (tc.card.type === 'suited' && tc.card.suit === leadSuit && tc.card.number) {
+      if (tc.card.number > highestValue) {
+        highestValue = tc.card.number;
+        winner = tc;
+      }
+    }
+  }
+  
+  return { winnerId: winner.playerId, bonuses };
+}
+
+function scoreRound(players: Player[], roundNumber: number): Player[] {
+  return players.map(player => {
+    const bid = player.bid ?? 0;
+    const won = player.tricksWon;
+    let roundScore = 0;
+    
+    if (bid === won) {
+      if (bid === 0) {
+        roundScore = 10 * roundNumber;
+      } else {
+        roundScore = 20 * bid;
+      }
+    } else {
+      if (bid === 0) {
+        roundScore = -10 * roundNumber;
+      } else {
+        roundScore = -10 * Math.abs(won - bid);
+      }
+    }
+    
+    return {
+      ...player,
+      score: player.score + roundScore,
+      roundScores: [...player.roundScores, roundScore]
+    };
+  });
+}
+
+// ============================================================================
+// CARD COMPONENT
+// ============================================================================
+
+function CardDisplay({ card, onClick, disabled, small }: { card: Card; onClick?: () => void; disabled?: boolean; small?: boolean }) {
+  const getSuitColor = (suit?: Suit) => {
+    if (suit === 'yellow') return 'bg-yellow-100 border-yellow-400 text-yellow-900';
+    if (suit === 'purple') return 'bg-purple-100 border-purple-400 text-purple-900';
+    if (suit === 'green') return 'bg-green-100 border-green-400 text-green-900';
+    if (suit === 'black') return 'bg-gray-700 border-gray-900 text-white';
+    return 'bg-white border-gray-400';
+  };
+  
+  const getSuitIcon = (suit?: Suit) => {
+    if (suit === 'yellow') return <Circle className="w-4 h-4" />;
+    if (suit === 'purple') return <Heart className="w-4 h-4" />;
+    if (suit === 'green') return <Spade className="w-4 h-4" />;
+    if (suit === 'black') return <Anchor className="w-4 h-4" />;
+    return null;
+  };
+  
+  const getSpecialDisplay = (special?: SpecialType) => {
+    if (special === 'skullking') return { icon: <Skull className="w-8 h-8" />, label: 'Skull King', bg: 'bg-red-600 text-white' };
+    if (special === 'pirate') return { icon: <Flag className="w-8 h-8" />, label: 'Pirate', bg: 'bg-orange-600 text-white' };
+    if (special === 'mermaid') return { icon: <Crown className="w-8 h-8" />, label: 'Mermaid', bg: 'bg-blue-400 text-white' };
+    if (special === 'escape') return { icon: <span className="text-2xl">🏃</span>, label: 'Escape', bg: 'bg-gray-300 text-gray-700' };
+    return null;
+  };
+  
+  const sizeClass = small ? 'w-16 h-24' : 'w-20 h-32';
+  const textSize = small ? 'text-lg' : 'text-2xl';
+  
+  if (card.type === 'suited') {
+    return (
+      <button
+        onClick={onClick}
+        disabled={disabled}
+        className={`${sizeClass} ${getSuitColor(card.suit)} border-2 rounded-lg flex flex-col items-center justify-center font-bold ${textSize} transition-transform hover:scale-105 disabled:opacity-50 disabled:hover:scale-100 shadow-md`}
+      >
+        <div>{card.number}</div>
+        {getSuitIcon(card.suit)}
+      </button>
+    );
+  }
+  
+  const special = getSpecialDisplay(card.special);
+  if (!special) return null;
+  
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className={`${sizeClass} ${special.bg} border-2 border-gray-800 rounded-lg flex flex-col items-center justify-center transition-transform hover:scale-105 disabled:opacity-50 disabled:hover:scale-100 shadow-md`}
+    >
+      {special.icon}
+      <div className="text-xs mt-1">{special.label}</div>
+    </button>
+  );
+}
+
+// ============================================================================
+// MAIN GAME COMPONENT
+// ============================================================================
+
+export default function SkullKingGame() {
+  const [phase, setPhase] = useState<GamePhase>('setup');
+  const [config, setConfig] = useState<GameConfig>({ numPlayers: 3, playerNames: [], maxRounds: 10 });
+  const [players, setPlayers] = useState<Player[]>([]);
+  const [currentRound, setCurrentRound] = useState(1);
+  const [currentPlayerIdx, setCurrentPlayerIdx] = useState(0);
+  const [currentTrick, setCurrentTrick] = useState<TrickCard[]>([]);
+  const [trickWinnerId, setTrickWinnerId] = useState<string | null>(null);
+  const [showingHand, setShowingHand] = useState(false);
+  const [roundBonuses, setRoundBonuses] = useState<{ [playerId: string]: { skullKingPirates: number; skullKingMermaid: number } }>({});
+
+  const startGame = (numPlayers: number, names: string[]) => {
+    const newPlayers: Player[] = names.map((name, idx) => ({
+      id: `p${idx}`,
+      name,
+      hand: [],
+      bid: null,
+      tricksWon: 0,
+      score: 0,
+      roundScores: []
+    }));
+    
+    setPlayers(dealHands(newPlayers, 1));
+    setConfig({ ...config, numPlayers, playerNames: names });
+    setCurrentRound(1);
+    setCurrentPlayerIdx(0);
+    setPhase('bidding');
+    setRoundBonuses({});
+  };
+
+  const placeBid = (bid: number) => {
+    const updated = [...players];
+    updated[currentPlayerIdx].bid = bid;
+    setPlayers(updated);
+    
+    if (currentPlayerIdx < players.length - 1) {
+      setCurrentPlayerIdx(currentPlayerIdx + 1);
+      setShowingHand(false);
+    } else {
+      setCurrentPlayerIdx(0);
+      setPhase('playing');
+      setShowingHand(false);
+    }
+  };
+
+  const playCard = (card: Card) => {
+    const player = players[currentPlayerIdx];
+    const leadSuit = getLeadSuit(currentTrick);
+    const legal = getLegalMoves(player.hand, currentTrick, leadSuit);
+    
+    if (!legal.find(c => c.id === card.id)) return;
+    
+    const newTrick = [...currentTrick, { card, playerId: player.id }];
+    const newHand = player.hand.filter(c => c.id !== card.id);
+    
+    const updated = [...players];
+    updated[currentPlayerIdx].hand = newHand;
+    setPlayers(updated);
+    setCurrentTrick(newTrick);
+    
+    if (newTrick.length === players.length) {
+      // Trick complete
+      const result = resolveTrick(newTrick);
+      const winnerIdx = players.findIndex(p => p.id === result.winnerId);
+      
+      updated[winnerIdx].tricksWon += 1;
+      setPlayers(updated);
+      setTrickWinnerId(result.winnerId);
+      
+      // Track bonuses
+      if (result.bonuses.skullKingPirates > 0 || result.bonuses.skullKingMermaid > 0) {
+        setRoundBonuses({
+          ...roundBonuses,
+          [result.winnerId]: {
+            skullKingPirates: (roundBonuses[result.winnerId]?.skullKingPirates ?? 0) + result.bonuses.skullKingPirates,
+            skullKingMermaid: (roundBonuses[result.winnerId]?.skullKingMermaid ?? 0) + result.bonuses.skullKingMermaid
+          }
+        });
+      }
+      
+      setTimeout(() => {
+        setCurrentTrick([]);
+        setTrickWinnerId(null);
+        
+        if (newHand.length === 0) {
+          // Round over
+          const scored = scoreRound(updated, currentRound).map(p => ({
+            ...p,
+            score: p.score + (roundBonuses[p.id]?.skullKingPirates ?? 0) + (roundBonuses[p.id]?.skullKingMermaid ?? 0)
+          }));
+          setPlayers(scored);
+          setPhase('roundEnd');
+        } else {
+          setCurrentPlayerIdx(winnerIdx);
+          setShowingHand(false);
+        }
+      }, 2000);
+    } else {
+      setCurrentPlayerIdx((currentPlayerIdx + 1) % players.length);
+      setShowingHand(false);
+    }
+  };
+
+  const nextRound = () => {
+    if (currentRound >= config.maxRounds) {
+      setPhase('gameEnd');
+    } else {
+      const newRound = currentRound + 1;
+      setCurrentRound(newRound);
+      setPlayers(dealHands(players, newRound));
+      setCurrentPlayerIdx(0);
+      setCurrentTrick([]);
+      setPhase('bidding');
+      setShowingHand(false);
+      setRoundBonuses({});
+    }
+  };
+
+  // SETUP PHASE
+  if (phase === 'setup') {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-blue-900 to-purple-900 text-white p-8">
+        <div className="max-w-2xl mx-auto">
+          <div className="flex items-center justify-center mb-8">
+            <Skull className="w-16 h-16 mr-4" />
+            <h1 className="text-5xl font-bold">Skull King</h1>
+          </div>
+          
+          <div className="bg-white/10 backdrop-blur rounded-lg p-8">
+            <h2 className="text-2xl font-bold mb-4">Game Setup</h2>
+            
+            <div className="mb-6">
+              <label className="block mb-2">Number of Players (2-6)</label>
+              <input
+                type="number"
+                min="2"
+                max="6"
+                value={config.numPlayers}
+                onChange={(e) => setConfig({ ...config, numPlayers: parseInt(e.target.value) || 2 })}
+                className="w-full px-4 py-2 rounded bg-white/20 text-white"
+              />
+            </div>
+            
+            <div className="mb-6">
+              <label className="block mb-2">Player Names</label>
+              {Array.from({ length: config.numPlayers }).map((_, idx) => (
+                <input
+                  key={idx}
+                  type="text"
+                  placeholder={`Player ${idx + 1}`}
+                  onChange={(e) => {
+                    const names = [...config.playerNames];
+                    names[idx] = e.target.value || `Player ${idx + 1}`;
+                    setConfig({ ...config, playerNames: names });
+                  }}
+                  className="w-full px-4 py-2 rounded bg-white/20 text-white mb-2"
+                />
+              ))}
+            </div>
+            
+            <div className="mb-6">
+              <label className="block mb-2">Max Rounds</label>
+              <input
+                type="number"
+                min="1"
+                max="10"
+                value={config.maxRounds}
+                onChange={(e) => setConfig({ ...config, maxRounds: parseInt(e.target.value) || 10 })}
+                className="w-full px-4 py-2 rounded bg-white/20 text-white"
+              />
+            </div>
+            
+            <button
+              onClick={() => {
+                const names = Array.from({ length: config.numPlayers }).map((_, i) => 
+                  config.playerNames[i] || `Player ${i + 1}`
+                );
+                startGame(config.numPlayers, names);
+              }}
+              className="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-3 rounded-lg transition"
+            >
+              Start Game
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const currentPlayer = players[currentPlayerIdx];
+  const leadSuit = getLeadSuit(currentTrick);
+  const legalMoves = currentPlayer ? getLegalMoves(currentPlayer.hand, currentTrick, leadSuit) : [];
+
+  // BIDDING PHASE
+  if (phase === 'bidding') {
+    if (!showingHand) {
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-blue-900 to-purple-900 text-white p-8 flex items-center justify-center">
+          <div className="bg-white/10 backdrop-blur rounded-lg p-8 text-center">
+            <h2 className="text-3xl font-bold mb-4">Round {currentRound}</h2>
+            <p className="text-xl mb-6">{currentPlayer.name}'s turn to bid</p>
+            <button
+              onClick={() => setShowingHand(true)}
+              className="bg-blue-600 hover:bg-blue-700 px-8 py-3 rounded-lg font-bold transition"
+            >
+              Show My Hand
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-blue-900 to-purple-900 text-white p-8">
+        <div className="max-w-6xl mx-auto">
+          <h2 className="text-3xl font-bold mb-4 text-center">Round {currentRound} - Bidding</h2>
+          <p className="text-xl mb-6 text-center">{currentPlayer.name}, place your bid</p>
+          
+          <div className="flex flex-wrap gap-4 justify-center mb-8">
+            {currentPlayer.hand.map(card => (
+              <CardDisplay key={card.id} card={card} disabled />
+            ))}
+          </div>
+          
+          <div className="bg-white/10 backdrop-blur rounded-lg p-6">
+            <p className="text-center mb-4">How many tricks will you win?</p>
+            <div className="flex flex-wrap gap-3 justify-center">
+              {Array.from({ length: currentRound + 1 }).map((_, bid) => (
+                <button
+                  key={bid}
+                  onClick={() => placeBid(bid)}
+                  className="bg-green-600 hover:bg-green-700 px-6 py-3 rounded-lg font-bold transition"
+                >
+                  {bid}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // PLAYING PHASE
+  if (phase === 'playing') {
+    if (!showingHand) {
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-blue-900 to-purple-900 text-white p-8 flex items-center justify-center">
+          <div className="bg-white/10 backdrop-blur rounded-lg p-8 text-center">
+            <h2 className="text-3xl font-bold mb-4">Round {currentRound}</h2>
+            <p className="text-xl mb-6">{currentPlayer.name}'s turn to play</p>
+            <button
+              onClick={() => setShowingHand(true)}
+              className="bg-blue-600 hover:bg-blue-700 px-8 py-3 rounded-lg font-bold transition"
+            >
+              Show My Hand
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-blue-900 to-purple-900 text-white p-8">
+        <div className="max-w-6xl mx-auto">
+          <div className="flex justify-between items-center mb-4">
+            <h2 className="text-2xl font-bold">Round {currentRound}</h2>
+            <div className="text-right">
+              <p className="font-bold">{currentPlayer.name}</p>
+              <p className="text-sm">Bid: {currentPlayer.bid} | Won: {currentPlayer.tricksWon}</p>
+            </div>
+          </div>
+
+          {/* Scoreboard */}
+          <div className="bg-white/10 backdrop-blur rounded-lg p-4 mb-6">
+            <div className="flex justify-around">
+              {players.map(p => (
+                <div key={p.id} className={`text-center ${p.id === currentPlayer.id ? 'font-bold text-yellow-400' : ''}`}>
+                  <div>{p.name}</div>
+                  <div className="text-sm">Score: {p.score}</div>
+                  <div className="text-xs">Bid: {p.bid} | Won: {p.tricksWon}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Current Trick */}
+          <div className="bg-white/10 backdrop-blur rounded-lg p-6 mb-6">
+            <h3 className="text-xl font-bold mb-4 text-center">Current Trick</h3>
+            <div className="flex flex-wrap gap-4 justify-center min-h-[150px] items-center">
+              {currentTrick.length === 0 ? (
+                <p className="text-gray-400">No cards played yet</p>
+              ) : (
+                currentTrick.map((tc, idx) => (
+                  <div key={idx} className="text-center">
+                    <CardDisplay card={tc.card} disabled small />
+                    <p className="text-xs mt-2">{players.find(p => p.id === tc.playerId)?.name}</p>
+                  </div>
+                ))
+              )}
+            </div>
+            {trickWinnerId && (
+              <p className="text-center mt-4 text-green-400 font-bold">
+                {players.find(p => p.id === trickWinnerId)?.name} wins this trick!
+              </p>
+            )}
+          </div>
+
+          {/* Player's Hand */}
+          <div className="bg-white/10 backdrop-blur rounded-lg p-6">
+            <h3 className="text-xl font-bold mb-4 text-center">Your Hand</h3>
+            {leadSuit && <p className="text-center mb-2 text-yellow-400">Lead suit: {leadSuit}</p>}
+            <div className="flex flex-wrap gap-4 justify-center">
+              {currentPlayer.hand.map(card => (
+                <CardDisplay
+                  key={card.id}
+                  card={card}
+                  onClick={() => playCard(card)}
+                  disabled={!legalMoves.find(c => c.id === card.id) || trickWinnerId !== null}
+                />
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ROUND END
+  if (phase === 'roundEnd') {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-blue-900 to-purple-900 text-white p-8">
+        <div className="max-w-4xl mx-auto">
+          <h2 className="text-4xl font-bold mb-8 text-center">Round {currentRound} Complete!</h2>
+          
+          <div className="bg-white/10 backdrop-blur rounded-lg p-6 mb-6">
+            <table className="w-full">
+              <thead>
+                <tr className="border-b border-white/20">
+                  <th className="text-left p-2">Player</th>
+                  <th className="p-2">Bid</th>
+                  <th className="p-2">Won</th>
+                  <th className="p-2">Round Score</th>
+                  <th className="p-2">Total Score</th>
+                </tr>
+              </thead>
+              <tbody>
+                {players.map(p => (
+                  <tr key={p.id} className="border-b border-white/10">
+                    <td className="p-2 font-bold">{p.name}</td>
+                    <td className="p-2 text-center">{p.bid}</td>
+                    <td className="p-2 text-center">{p.tricksWon}</td>
+                    <td className="p-2 text-center">{p.roundScores[p.roundScores.length - 1]}</td>
+                    <td className="p-2 text-center font-bold">{p.score}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          
+          <button
+            onClick={nextRound}
+            className="w-full bg-green-600 hover:bg-green-700 text-white font-bold py-4 rounded-lg transition"
+          >
+            {currentRound >= config.maxRounds ? 'View Final Results' : 'Next Round'}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // GAME END
+  if (phase === 'gameEnd') {
+    const sorted = [...players].sort((a, b) => b.score - a.score);
+    
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-blue-900 to-purple-900 text-white p-8">
+        <div className="max-w-4xl mx-auto">
+          <div className="flex items-center justify-center mb-8">
+            <Trophy className="w-16 h-16 mr-4 text-yellow-400" />
+            <h2 className="text-5xl font-bold">Game Over!</h2>
+          </div>
+          
+          <div className="bg-white/10 backdrop-blur rounded-lg p-8 mb-6">
+            <h3 className="text-3xl font-bold mb-6 text-center text-yellow-400">
+              🎉 {sorted[0].name} Wins! 🎉
+            </h3>
+            
+            <div className="space-y-4">
+              {sorted.map((p, idx) => (
+                <div key={p.id} className={`flex justify-between items-center p-4 rounded ${idx === 0 ? 'bg-yellow-500/20' : 'bg-white/5'}`}>
+                  <div className="flex items-center">
+                    <span className="text-2xl font-bold mr-4">#{idx + 1}</span>
+                    <span className="text-xl">{p.name}</span>
+                  </div>
+                  <span className="text-2xl font-bold">{p.score}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+          
+          <button
+            onClick={() => {
+              setPhase('setup');
+              setPlayers([]);
+              setCurrentRound(1);
+            }}
+            className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 rounded-lg transition"
+          >
+            New Game
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return null;
+}
